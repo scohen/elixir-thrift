@@ -128,7 +128,7 @@ defmodule ThriftTestCase do
     Path.wildcard("#{erlang_source_dir}/*.erl")
     |> Enum.map(fn source_file ->
       {:ok, mod_name, code} = source_file
-      |> String.to_charlist
+      |> String.to_char_list
       |> :compile.file([:binary])
 
       :code.load_binary(mod_name, [], code)

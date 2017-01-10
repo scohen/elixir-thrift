@@ -13,7 +13,7 @@ defmodule Thrift.Binary.Framed.Client do
   alias Thrift.Protocol.Binary
   alias Thrift.TApplicationException
 
-  @immutable_tcp_opts [active: false, packet: 4, mode: :binary]
+  @immutable_tcp_opts [active: 10, packet: 4, mode: :binary]
 
   @type error :: {:error, atom}
   @type success :: {:ok, binary}
@@ -50,8 +50,10 @@ defmodule Thrift.Binary.Framed.Client do
                       sock: pid,
                       seq_id: integer,
                       retry: boolean,
-                      last_message: any
-                     }
+                      last_message: any,
+                      caller: pid,
+                      thrift_message_data: {String.t, pos_integer}}
+
     defstruct host: nil,
               port: nil,
               tcp_opts: nil,
@@ -59,7 +61,9 @@ defmodule Thrift.Binary.Framed.Client do
               sock: nil,
               seq_id: 0,
               retry: false,
-              last_message: nil
+              last_message: nil,
+              caller: nil,
+              thrift_message_data: nil
   end
 
   require Logger
@@ -211,20 +215,12 @@ defmodule Thrift.Binary.Framed.Client do
     message = Binary.serialize(:message_begin, {:call, seq_id, rpc_name})
     timeout = Keyword.get(tcp_opts, :timeout, default_timeout)
 
-    rsp = with :ok <- :gen_tcp.send(sock, [message | serialized_args]) do
-      :gen_tcp.recv(sock, 0, timeout)
-    end
-
-    case rsp do
-      {:ok, message} ->
-        reply =  deserialize_message_reply(message, rpc_name, seq_id)
-        {:reply, reply, s}
-
-      {:error, :timeout} = timeout ->
-        {:reply, timeout, s}
+    case :gen_tcp.send(sock, [message | serialized_args]) do
+      :ok ->
+        {:noreply, %{s | caller: caller, thrift_message_data: {rpc_name, seq_id}}}
 
       {:error, :closed} = err ->
-        {:disconnect, {:retry, err}, %{s |last_message: {call_args, caller}}}
+        {:disconnect, {:retry, err}, %{s | last_message: {call_args, caller}}}
 
       {:error, _} = error ->
         {:disconnect, error, error, s}
@@ -252,6 +248,32 @@ defmodule Thrift.Binary.Framed.Client do
       {:error, _} = error ->
         {:disconnect, error, s}
     end
+  end
+
+  def handle_info({:tcp, _, _}, %{caller: nil} = state) do
+    # handle the empty response of a void
+    {:noreply, state}
+  end
+
+  def handle_info({:tcp, socket, message}, %{caller: caller, thrift_message_data: {rpc_name, seq_id}} = state) do
+    decoded_message = deserialize_message_reply(message, rpc_name, seq_id)
+    Connection.reply(caller, decoded_message)
+
+    {:noreply, %{state | caller: nil, thrift_message_data: nil}}
+  end
+
+  def handle_info({:tcp_closed, socket}, _) do
+    {:stop, {:error, :closed}, nil}
+  end
+
+  def handle_info({:tcp_passive, socket}, state) do
+    :inet.setopts(socket, active: 10)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:tcp_error, socket, reason}, _) do
+    {:stop, {:error, reason}, nil}
   end
 
   def deserialize_message_reply(message, rpc_name, seq_id) do
